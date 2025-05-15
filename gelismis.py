@@ -1,52 +1,26 @@
 import os
 import time
-import requests
-from bs4 import BeautifulSoup
+import pytz
+from datetime import datetime
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, ConversationHandler
+from apscheduler.schedulers.background import BackgroundScheduler
+from tinydb import TinyDB, Query
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+import requests
+from bs4 import BeautifulSoup
 
-# === Ortam değişkeninden BOT_TOKEN al ===
-TOKEN = os.getenv("BOT_TOKEN")
+# === Sabitler ===
+TOKEN = "7632465441:AAHs-pCXftmiCGGpSDVOaAqp_S_XfgDryWE"
 SABIT_SIFRE = "123456"
+db = TinyDB("veri.json")
+User = Query()
 
-# === /start komutu ===
-def start(update: Update, context: CallbackContext):
-    mesaj = (
-        "🎉 Bota hoş geldiniz!\n\n"
-        "📢 /duyurular yazarak duyurulara erişebilirsiniz.\n"
-        "📘 Öğrenci numaranızı yazarak notunuzu öğrenebilirsiniz.\n"
-        "🔁 En başa dönmek için her zaman /start yazabilirsiniz."
-    )
-    update.message.reply_text(mesaj)
+# === Aşamalar ===
+OGRENCINO = range(1)
 
-# === /duyurular komutu ===
-def get_announcements():
-    url = "https://makina.deu.edu.tr/tr/tum-duyurular/"
-    response = requests.get(url)
-    soup = BeautifulSoup(response.text, "html.parser")
-    container = soup.find("div", class_="su-tabs-panes")
-
-    if not container:
-        return ["❌ Duyuru alanı bulunamadı."]
-
-    duyurular = []
-    for i, div in enumerate(container.find_all("div", recursive=False)[:3], 1):
-        title_tag = div.find("h3")
-        link_tag = div.find("a", href=True)
-
-        title = title_tag.get_text(strip=True) if title_tag else "Başlık bulunamadı"
-        link = link_tag["href"] if link_tag else "Bağlantı yok"
-
-        duyurular.append(f"{i}. {title}\n🔗 {link}")
-    return duyurular
-
-def duyurular(update: Update, context: CallbackContext):
-    for duyuru in get_announcements():
-        update.message.reply_text(duyuru)
-
-# === Öğrenci no ile not kontrol ===
+# === Ders kontrol fonksiyonu ===
 def ders_kontrol(ogr_no):
     try:
         options = webdriver.ChromeOptions()
@@ -81,30 +55,87 @@ def ders_kontrol(ogr_no):
     except Exception as e:
         return f"❌ Hata oluştu:\n{e}"
 
-# === Metin mesajı işleyici ===
-def mesaj_yanita(update: Update, context: CallbackContext):
-    ogr_no = update.message.text.strip()
+# === /start komutu ===
+def start(update: Update, context: CallbackContext):
+    mesaj = (
+        "🎓 Merhaba!\n"
+        "Lütfen öğrenci numaranızı yazın, ders kaydınız otomatik olarak günde 2 defa kontrol edilecek.\n"
+        "Ayrıca /duyurular komutu ile DEÜ Makine Mühendisliği duyurularına erişebilirsiniz.\n"
+        "Bilgilerinizi tamamen silmek için /sil yazabilirsiniz."
+    )
+    update.message.reply_text(mesaj)
+    return OGRENCINO
 
+# === Numara kaydet ===
+def ogrno_kaydet(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    ogr_no = update.message.text.strip()
     if not ogr_no.isdigit() or len(ogr_no) != 10:
-        update.message.reply_text("❗ Lütfen geçerli 10 haneli öğrenci numarası girin.")
+        update.message.reply_text("❗ Lütfen 10 haneli geçerli bir öğrenci numarası girin.")
+        return OGRENCINO
+
+    db.upsert({"user_id": user_id, "ogr_no": ogr_no}, User.user_id == user_id)
+    update.message.reply_text("✅ Numaran kaydedildi. Artık her gün saat 09:00 ve 17:00'de otomatik kontrol yapılacak.")
+    return ConversationHandler.END
+
+# === Otomatik kontrol fonksiyonu ===
+def otomatik_kontrol():
+    now = datetime.now(pytz.timezone("Europe/Istanbul"))
+    for k in db.all():
+        ogr_no = k.get("ogr_no")
+        if ogr_no:
+            sonuc = ders_kontrol(ogr_no)
+            updater.bot.send_message(chat_id=k["user_id"], text=f"📢 Otomatik kontrol ({now.strftime('%H:%M')}):\n{sonuc}")
+
+# === /duyurular komutu ===
+def duyurular(update: Update, context: CallbackContext):
+    url = "https://makina.deu.edu.tr/tr/tum-duyurular/"
+    response = requests.get(url)
+    soup = BeautifulSoup(response.text, "html.parser")
+    container = soup.find("div", class_="su-tabs-panes")
+
+    if not container:
+        update.message.reply_text("❌ Duyuru alanı bulunamadı.")
         return
 
-    update.message.reply_text("🔍 Ders kaydınız kontrol ediliyor...")
-    sonuc = ders_kontrol(ogr_no)
-    update.message.reply_text(sonuc)
+    duyurular = []
+    for i, div in enumerate(container.find_all("div", recursive=False)[:3], 1):
+        title_tag = div.find("h3")
+        link_tag = div.find("a", href=True)
+
+        title = title_tag.get_text(strip=True) if title_tag else "Başlık bulunamadı"
+        link = link_tag["href"] if link_tag else "Bağlantı yok"
+
+        duyurular.append(f"{i}. {title}\n🔗 {link}")
+
+    for duyuru in duyurular:
+        update.message.reply_text(duyuru)
+
+# === /sil komutu ===
+def sil(update: Update, context: CallbackContext):
+    db.remove(User.user_id == update.effective_user.id)
+    update.message.reply_text("🧨 Tüm verileriniz silindi. /start ile yeniden başlayabilirsiniz.")
 
 # === Botu başlat ===
-def main():
-    updater = Updater(TOKEN, use_context=True)
-    dp = updater.dispatcher
+updater = Updater(TOKEN, use_context=True)
+dp = updater.dispatcher
 
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("duyurular", duyurular))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, mesaj_yanita))
+# === Komutlar ===
+dp.add_handler(ConversationHandler(
+    entry_points=[CommandHandler("start", start)],
+    states={OGRENCINO: [MessageHandler(Filters.text & ~Filters.command, ogrno_kaydet)]},
+    fallbacks=[]
+))
 
-    updater.start_polling()
-    print("✅ Bot çalışıyor...")
-    updater.idle()
+dp.add_handler(CommandHandler("duyurular", duyurular))
+dp.add_handler(CommandHandler("sil", sil))
 
-if __name__ == '__main__':
-    main()
+# === Planlayıcı ===
+scheduler = BackgroundScheduler(timezone=pytz.timezone("Europe/Istanbul"))
+scheduler.add_job(otomatik_kontrol, 'cron', hour=9, minute=0)
+scheduler.add_job(otomatik_kontrol, 'cron', hour=17, minute=0)
+scheduler.start()
+
+updater.start_polling()
+print("✅ Otomatik kontrol botu çalışıyor...")
+updater.idle()
